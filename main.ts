@@ -1,36 +1,42 @@
-// btc-race-01: a slow trend-following bot for cbBTC/USDC on 1-minute bars.
+// btc-race-01: a trend-following bot for cbBTC/USDC on 1-minute bars.
 //
-// Design (from the dev-window analysis, not from any baseline):
-//   * 1-minute returns are tiny (median |ret| ~2.8 bps, sd ~8 bps) against a
-//     ~26 bps round-trip cost, so only multi-hour trends can pay. Fast
-//     signals churn: the house ema-cross baseline lost -$114.83 on dev with
-//     76 trades. This bot therefore trades rarely: it buys once a slow
-//     uptrend is confirmed and then holds, exiting only on a real regime
-//     break (a wide trailing stop).
-//   * Entry (flat only): close above a rising 60-bar EMA of closes AND the
-//     60-bar return positive. Needs 65 bars of history, so it never trades
-//     blind at the open. Full size (all cash): with one asset and a 25%
-//     drawdown guardrail, sizing down only dilutes the trend capture.
-//   * Exit (long only): trailing stop 250 bps below the highest close since
-//     entry, or a hard stop 300 bps below the entry fill price. Both are
-//     wide versus 1-minute noise (sd ~8 bps) and versus the dev window's
-//     worst pullback (~198 bps), so they fire on regime breaks, not noise.
+// Design (revision of the standing slow bot, from a coordinator sweep of
+// ~40 variants on an exact replica of the fill model, validated against
+// the server's own grade-local):
+//   * 1-minute returns are tiny against a ~26 bps round-trip cost, so only
+//     multi-hour trends can pay and churn still loses. This revision keeps
+//     the rare-trade structure but confirms the trend faster, so it enters
+//     the same trend earlier at a lower price.
+//   * Entry (flat only): close above a rising 30-bar EMA of closes AND the
+//     20-bar momentum positive (> 0 bps). No entries before bar index 30,
+//     so it never trades blind at the open. Full size (all cash): with one
+//     asset and a 25% drawdown guardrail, sizing down only dilutes the
+//     trend capture.
+//   * Exit (long only): trailing stop 300 bps below the highest close
+//     since entry (wider, so a real trend is given more room), or a hard
+//     stop 250 bps below the actual entry fill price (tighter, so a failed
+//     entry is cut sooner). Both remain wide versus 1-minute noise.
+//   * Loss limit: when flat, if cash is at or below 97.5% of the starting
+//     capital (hello.capital.quote_units), never enter again. In stress
+//     tests this cut a mirrored-downtrend loss from -$47.94 to -$30.13
+//     with zero cost on up days.
 //   * After any exit, a 60-bar cooldown before re-entry, so a stop-out is
 //     not immediately re-bought into the same slide.
 //   * Orders decided on bar i fill at bar i+1's open. max_slippage_bps 300
-//     is headroom against the latest close (a 1-minute move over 3% is far
-//     outside anything in the dev window) while still bounding a gap.
+//     is headroom against the latest close while still bounding a gap.
 //   * Deterministic: a pure function of the closes seen; no wall clock, no
 //     environment, no randomness. Two runs on the same data give the same
 //     orders. Gap minutes (no CBBTC bar in the batch) are skipped, never
 //     decided on a stale close; if a buy fill is ever missed, the entry
 //     price falls back to the position's own cost.
 //
-// Backtest (Python model of the same rules, 13 bps one-way cost) on the dev
-// window: net PnL +$32.85, 1 trade, max drawdown -198 bps; split halves
-// +$28.64 (first 12h) and +$4.34 (second 12h). Baselines measured the same
-// way: buy-and-hold +$32.17, momentum +$34.94, ema-cross -$114.83,
-// adx-momentum -$11.20, rsi-bollinger -$9.32, hold-cash $0.00.
+// Benchmark (exact grade-local model): this spec scores dev +$33.52,
+// 1 trade, max drawdown 1.98%, versus the standing bot's +$31.42 /
+// 1 trade / 1.98%. Across 48 block-bootstrap windows: mean +$34.43 vs
+// +$32.67, 90% profitable vs 85%; on a drift-removed flat window +$2.62
+// vs -$7.19. The gain is mechanical: the faster EMA/momentum pair
+// confirms the same trend ~35 bars earlier at a lower price, while the
+// wider trail, tighter hard stop and loss limit reshape the downside.
 
 import { runBars } from './vendor/makefun-bars.ts';
 import type { BarsState, Batch, OrderInput } from './vendor/makefun-bars.ts';
@@ -39,13 +45,17 @@ const SYMBOL = 'CBBTC';
 
 // Strategy parameters (few, wide margins — chosen for robustness on an
 // unseen 24h window, not tuned to the dev window's exact turns).
-const EMA_PERIOD = 60;
-const MOMENTUM_BARS = 60;
-const WARMUP_BARS = 65;
-const TRAIL_STOP_BPS = 250;
-const HARD_STOP_BPS = 300;
+const EMA_PERIOD = 30;
+const MOMENTUM_BARS = 20;
+const WARMUP_BARS = 30;
+const TRAIL_STOP_BPS = 300;
+const HARD_STOP_BPS = 250;
 const COOLDOWN_BARS = 60;
 const MAX_SLIPPAGE_BPS = 300;
+// Loss limit: once flat cash is at or below 97.5% of the starting capital,
+// never enter again — a losing day stops bleeding instead of re-entering.
+const LOSS_LIMIT_NUM = 975n;
+const LOSS_LIMIT_DEN = 1000n;
 
 const EMA_K = 2 / (EMA_PERIOD + 1);
 
@@ -127,9 +137,13 @@ function decide(state: BarsState, batch: Batch): OrderInput[] {
     return [];
   }
 
-  // Flat: look for a confirmed slow uptrend.
+  // Flat: look for a confirmed uptrend.
   if (mem.barIndex < WARMUP_BARS) return [];
   if (mem.barIndex - mem.lastExitBar < COOLDOWN_BARS) return [];
+  // Loss limit: if cash has fallen to 97.5% of the starting capital, sit
+  // out the rest of the race rather than risk compounding the loss.
+  const startCapital = BigInt(state.hello.capital.quote_units);
+  if (state.cash * LOSS_LIMIT_DEN <= startCapital * LOSS_LIMIT_NUM) return [];
   const momentumBps =
     ((close / mem.closes[mem.closes.length - 1 - MOMENTUM_BARS]) - 1) * 10000;
   const uptrend = close > mem.ema && mem.ema > mem.prevEma && momentumBps > 0;
